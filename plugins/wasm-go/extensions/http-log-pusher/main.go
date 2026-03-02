@@ -318,54 +318,42 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byt
 		entry.InputTokens, entry.OutputTokens, entry.TotalTokens)
 	log.Infof("[http-log-pusher] =========================")
 
-	// ⚠️ 重要：在这里读取 AI 日志（函数的最后）
-	// 从 Envoy Filter State 读取 AI 日志
-	// ai-statistics 插件通过 WriteUserAttributeToLogWithKey() 将数据写入此处
-	// 
-	// 注意：即使优先级设置正确（ai-statistics=200, http-log-pusher=1），
-	// 也可能读取不到完整数据，因为在同一个回调函数内，插件可能是"交错执行"的。
-	// 
-	// 如果读取失败，请检查：
-	// 1. WasmPlugin 的 priority 配置（ai-statistics 应该 > http-log-pusher）
-	// 2. 查看日志中的时间戳，确认执行顺序
-	// 3. 考虑使用 Envoy Access Log 代替插件间数据传递
 	aiLogBytes, err := proxywasm.GetProperty([]string{wrapper.AILogKey})
 	if err == nil && len(aiLogBytes) > 0 {
-		// 尝试解析 AI 日志数据
-		// 首先尝试将其视为字符串并解析为 JSON
-		aiLogStr := string(aiLogBytes)
-		log.Debugf("[http-log-pusher] raw AI log data: %s", aiLogStr)
+		rawStr := string(aiLogBytes)
 		
-		//检查是否已经是有效的 JSON格式
-		if json.Valid([]byte(aiLogStr)) {
-			// 如果是有效的 JSON，直接使用
-			entry.AILog = json.RawMessage(aiLogStr)
-			log.Infof("[http-log-pusher] ✅ successfully read valid AI log, length=%d", len(entry.AILog))
-		} else {
-			//处理转义的JSON字符串: "{\"key\":\"value\"}"
-			if decodedBytes, decodeErr := strconv.Unquote(aiLogStr); decodeErr == nil {
-				if json.Valid([]byte(decodedBytes)) {
-					entry.AILog = json.RawMessage(decodedBytes)
-					log.Infof("[http-log-pusher] ✅ successfully unquoted and parsed AI log, length=%d", len(entry.AILog))
-				} else {
-					log.Warnf("[http-log-pusher] unquoted AI log is not valid JSON: %s", decodedBytes)
-					entry.AILog = json.RawMessage(`{}`)
-				}
-			} else {
-				log.Warnf("[http-log-pusher] AI log cannot be unquoted: %s, using empty JSON object", aiLogStr)
-				entry.AILog = json.RawMessage(`{}`)
+		// 1. 如果开头有双引号，说明是被包裹的字符串，需要先处理掉包裹
+		if strings.HasPrefix(rawStr, "\"") && strings.HasSuffix(rawStr, "\"") {
+			if unquoted, err := strconv.Unquote(rawStr); err == nil {
+				log.Debugf("[http-log-pusher] quoted AI log: %s", rawStr)
+				rawStr = unquoted
+				log.Debugf("[http-log-pusher] unquoted AI log: %s", rawStr)
 			}
 		}
-	} else {
-		// 当 AI 日志不存在时，使用空的 JSON 对象 {} 而不是 nil
-		// 这样可以确保数据库中存储的是有效的 JSON 而不是 NULL
-		entry.AILog = json.RawMessage(`{}`)
-		if err != nil {
-			log.Warnf("[http-log-pusher] ❌ failed to read AI log: %v, using empty JSON object", err)
+
+		// 2. 处理可能被转义的JSON字符串 (例如 "{\"api\":\"qwen3-plus\",\"model\":\"qwen3-max\",...}")
+		// 检查是否是以反斜杠转义的JSON字符串
+		if strings.Contains(rawStr, "\\\"") {
+			// 尝试Unescape字符串
+			unescapedStr := strings.ReplaceAll(rawStr, "\\\"", "\"")
+			unescapedStr = strings.ReplaceAll(unescapedStr, "\\\\", "\\")
+			
+			// 如果unescaped后是有效的JSON，则使用它
+			if json.Valid([]byte(unescapedStr)) {
+				rawStr = unescapedStr
+			}
+		}
+
+		// 3. 尝试直接作为 RawMessage。如果是有效的 JSON 内容，Marshal 时会自动处理
+		if json.Valid([]byte(rawStr)) {
+			entry.AILog = json.RawMessage(rawStr)
+			log.Infof("[http-log-pusher] ✅ Successfully parsed AI log")
 		} else {
-			log.Warnf("[http-log-pusher] ⚠️  AI log is empty (ai-statistics may not have written yet), using empty JSON object")
+			log.Warnf("[http-log-pusher] AI log is still invalid: %s", rawStr)
+			entry.AILog = json.RawMessage(`{}`)
 		}
 	}
+
 
 	// 2. 发送异步请求给 Collector
 	// 由于 AILog 现在是 json.RawMessage 类型，序列化时会保持原始JSON格式

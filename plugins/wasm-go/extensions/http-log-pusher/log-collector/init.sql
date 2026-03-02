@@ -55,7 +55,7 @@ CREATE TABLE `access_logs` (
   
   -- Istio + AI（2字段）
   `istio_policy_status` varchar(64) NULL DEFAULT NULL COMMENT 'Istio 策略状态',
-  `ai_log` text NULL DEFAULT NULL COMMENT 'WASM AI 日志 (JSON序列化字符串)',
+  `ai_log` json NULL DEFAULT NULL COMMENT 'WASM AI 日志 (JSON字符串)',
   
   -- ===== 监控元数据字段（8字段）=====
   `instance_id` varchar(128) NULL DEFAULT NULL COMMENT '实例ID（Pod名称或容器ID）',
