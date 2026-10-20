@@ -67,6 +67,7 @@ func getServerCommand() *cobra.Command {
 		},
 		RunE: func(c *cobra.Command, args []string) error {
 			cmd.PrintFlags(c.Flags())
+			log.Infof("[dev-pipeline] custom build from JayLi52/fork, pipeline date 2026-10-20")
 
 			stop := make(chan struct{})
 
