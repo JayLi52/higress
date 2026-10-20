@@ -21,7 +21,9 @@ import (
 )
 
 const (
-	pluginName = "ai-quota"
+	pluginName           = "ai-quota"
+	ctxKeyQuotaDeducted  = "quotaDeducted"
+	streamingContentType = "text/event-stream"
 )
 
 type ChatMode string
@@ -49,17 +51,20 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingResponseBody),
+		wrapper.ProcessResponseBody(onHttpResponseBody),
 	)
 }
 
 type QuotaConfig struct {
-	redisInfo       RedisInfo         `yaml:"redis"`
-	RedisKeyPrefix  string            `yaml:"redis_key_prefix"`
-	AdminConsumer   string            `yaml:"admin_consumer"`
-	AdminPath       string            `yaml:"admin_path"`
-	credential2Name map[string]string `yaml:"-"`
-	redisClient     wrapper.RedisClient
+	redisInfo          RedisInfo         `yaml:"redis"`
+	RedisKeyPrefix     string            `yaml:"redis_key_prefix"`
+	AdminConsumer      string            `yaml:"admin_consumer"`
+	AdminPath          string            `yaml:"admin_path"`
+	EnablePathSuffixes []string          `yaml:"enable_path_suffixes"`
+	credential2Name    map[string]string `yaml:"-"`
+	redisClient        wrapper.RedisClient
 }
 
 type Consumer struct {
@@ -83,6 +88,25 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	config.AdminConsumer = json.Get("admin_consumer").String()
 	if config.AdminPath == "" {
 		config.AdminPath = "/quota"
+	}
+	suffixResult := json.Get("enable_path_suffixes")
+	if !suffixResult.Exists() {
+		config.EnablePathSuffixes = []string{"/v1/chat/completions", "/v1/messages"}
+	} else if !suffixResult.IsArray() {
+		return errors.New("enable_path_suffixes must be an array")
+	} else {
+		pathSuffixes := suffixResult.Array()
+		config.EnablePathSuffixes = make([]string, 0, len(pathSuffixes))
+		for _, suffix := range pathSuffixes {
+			suffixStr := strings.TrimSpace(suffix.String())
+			if suffixStr == "" {
+				continue
+			}
+			config.EnablePathSuffixes = append(config.EnablePathSuffixes, suffixStr)
+		}
+	}
+	if len(config.EnablePathSuffixes) == 0 {
+		return errors.New("enable_path_suffixes must not be empty")
 	}
 	if config.AdminConsumer == "" {
 		return errors.New("missing admin_consumer in config")
@@ -144,7 +168,7 @@ func onHttpRequestHeaders(context wrapper.HttpContext, config QuotaConfig) types
 
 	rawPath := context.Path()
 	path, _ := url.Parse(rawPath)
-	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath)
+	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath, config.EnablePathSuffixes)
 	context.SetContext("chatMode", chatMode)
 	context.SetContext("adminMode", adminMode)
 	context.SetContext("consumer", consumer)
@@ -216,13 +240,38 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config QuotaConfig, body []byte)
 	return types.ActionContinue
 }
 
-func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool) []byte {
+func onHttpResponseHeaders(ctx wrapper.HttpContext, _ QuotaConfig) types.Action {
 	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
-	if !ok {
-		return data
+	if !ok || chatMode != ChatModeCompletion {
+		ctx.DontReadResponseBody()
+		return types.ActionContinue
 	}
-	if chatMode == ChatModeNone || chatMode == ChatModeAdmin {
-		return data
+
+	contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
+	if !strings.Contains(strings.ToLower(contentType), streamingContentType) {
+		ctx.BufferResponseBody()
+	}
+	return types.ActionContinue
+}
+
+func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool) []byte {
+	processResponseUsage(ctx, config, data, endOfStream)
+	return data
+}
+
+func onHttpResponseBody(ctx wrapper.HttpContext, config QuotaConfig, data []byte) types.Action {
+	processResponseUsage(ctx, config, data, true)
+	return types.ActionContinue
+}
+
+func processResponseUsage(ctx wrapper.HttpContext, config QuotaConfig, data []byte, endOfStream bool) {
+	if deducted, _ := ctx.GetContext(ctxKeyQuotaDeducted).(bool); deducted {
+		return
+	}
+
+	chatMode, ok := ctx.GetContext("chatMode").(ChatMode)
+	if !ok || chatMode != ChatModeCompletion {
+		return
 	}
 	if usage := tokenusage.GetTokenUsage(ctx, data); usage.TotalToken > 0 {
 		ctx.SetContext(tokenusage.CtxKeyInputToken, usage.InputToken)
@@ -231,20 +280,26 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 
 	// chat completion mode
 	if !endOfStream {
-		return data
+		return
 	}
 
-	if ctx.GetContext(tokenusage.CtxKeyInputToken) == nil || ctx.GetContext(tokenusage.CtxKeyOutputToken) == nil || ctx.GetContext("consumer") == nil {
-		return data
+	inputToken, inputTokenOK := ctx.GetContext(tokenusage.CtxKeyInputToken).(int64)
+	outputToken, outputTokenOK := ctx.GetContext(tokenusage.CtxKeyOutputToken).(int64)
+	consumer, consumerOK := ctx.GetContext("consumer").(string)
+	if !inputTokenOK || !outputTokenOK || !consumerOK || consumer == "" {
+		return
 	}
 
-	inputToken := ctx.GetContext(tokenusage.CtxKeyInputToken).(int64)
-	outputToken := ctx.GetContext(tokenusage.CtxKeyOutputToken).(int64)
-	consumer := ctx.GetContext("consumer").(string)
 	totalToken := int(inputToken + outputToken)
 	log.Debugf("update consumer:%s, totalToken:%d", consumer, totalToken)
-	config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, totalToken, nil)
-	return data
+
+	// Mark the request before dispatching so repeated end-of-stream callbacks cannot
+	// issue duplicate decrements. A synchronous dispatch failure is safe to retry.
+	ctx.SetContext(ctxKeyQuotaDeducted, true)
+	if err := config.redisClient.DecrBy(config.RedisKeyPrefix+consumer, totalToken, nil); err != nil {
+		ctx.SetContext(ctxKeyQuotaDeducted, false)
+		log.Errorf("failed to update consumer:%s quota: %v", consumer, err)
+	}
 }
 
 func deniedNoKeyAuthData() types.Action {
@@ -257,7 +312,7 @@ func deniedUnauthorizedConsumer() types.Action {
 	return types.ActionContinue
 }
 
-func getOperationMode(path string, adminPath string) (ChatMode, AdminMode) {
+func getOperationMode(path string, adminPath string, pathSuffixes []string) (ChatMode, AdminMode) {
 	fullAdminPath := "/v1/chat/completions" + adminPath
 	if strings.HasSuffix(path, fullAdminPath+"/refresh") {
 		return ChatModeAdmin, AdminModeRefresh
@@ -268,8 +323,10 @@ func getOperationMode(path string, adminPath string) (ChatMode, AdminMode) {
 	if strings.HasSuffix(path, fullAdminPath) {
 		return ChatModeAdmin, AdminModeQuery
 	}
-	if strings.HasSuffix(path, "/v1/chat/completions") {
-		return ChatModeCompletion, AdminModeNone
+	for _, suffix := range pathSuffixes {
+		if strings.HasSuffix(path, suffix) {
+			return ChatModeCompletion, AdminModeNone
+		}
 	}
 	return ChatModeNone, AdminModeNone
 }
